@@ -303,17 +303,22 @@ def create_movie_titles(conn, movie_id, site_id, title, description):
             pass
         return False
 
-def process_movies(conn, quantity, start_id=None):
+def process_movies(conn, site_ids, start_id=None, end_id=None):
     """Xử lý tất cả movies theo logic yêu cầu"""
-    print(f"\nBắt đầu xử lý movies với số lượng yêu cầu: {quantity}")
+    print(f"\nBắt đầu xử lý movies với danh sách site_ids: {site_ids}")
+    print(f"Số lượng titles sẽ gen cho mỗi phim: {len(site_ids)}")
     if start_id:
         print(f"Bắt đầu từ Movie ID: {start_id}")
+    if end_id:
+        print(f"Kết thúc tại Movie ID: {end_id}")
     print("=" * 50)
     
     try:
         with conn.cursor() as cur:
-            # Lấy movies từ start_id hoặc tất cả nếu không có start_id
-            if start_id:
+            # Lấy movies theo range hoặc tất cả
+            if start_id and end_id:
+                cur.execute("SELECT id, title, description FROM movie WHERE id >= %s AND id <= %s ORDER BY id", (start_id, end_id))
+            elif start_id:
                 cur.execute("SELECT id, title, description FROM movie WHERE id >= %s ORDER BY id", (start_id,))
             else:
                 cur.execute("SELECT id, title, description FROM movie ORDER BY id")
@@ -335,30 +340,38 @@ def process_movies(conn, quantity, start_id=None):
                 
                 # Bắt đầu transaction mới cho mỗi movie
                 try:
-                    # Kiểm tra số lượng title hiện có
-                    current_count = get_movie_titles_count(conn, movie_id)
-                    if current_count == -1:  # Lỗi khi đếm
-                        print("✗ Lỗi khi đếm titles, bỏ qua movie này")
-                        continue
-                        
-                    print(f"Số lượng title hiện có: {current_count}")
-                    
-                    if current_count >= quantity:
-                        print("✓ Đã đủ số lượng, bỏ qua")
-                        skipped_count += 1
-                        continue
-                    
-                    # Cần tạo thêm
-                    need_to_create = quantity - current_count
-                    print(f"Cần tạo thêm: {need_to_create} titles")
-                    
-                    # Lấy max site_id
+                    # Lấy max site_id hiện có để kiểm tra site_ids nào có thể sử dụng
                     max_site_id = get_max_site_id(conn, movie_id)
                     if max_site_id == -1:  # Lỗi khi lấy max_site_id
                         print("✗ Lỗi khi lấy max site_id, bỏ qua movie này")
                         continue
-                        
-                    current_site_id = max_site_id
+                    
+                    # Lọc ra các site_ids có thể sử dụng (chưa tồn tại)
+                    available_site_ids = []
+                    existing_site_ids = []
+                    
+                    for site_id in site_ids:
+                        # Kiểm tra xem site_id này đã tồn tại chưa
+                        with conn.cursor() as check_cur:
+                            check_cur.execute("SELECT COUNT(*) FROM movie_titles WHERE movie_id = %s AND site_id = %s", 
+                                            (movie_id, site_id))
+                            exists = check_cur.fetchone()[0] > 0
+                            
+                        if exists:
+                            existing_site_ids.append(site_id)
+                        else:
+                            available_site_ids.append(site_id)
+                    
+                    if existing_site_ids:
+                        print(f"Site_ids đã tồn tại: {existing_site_ids}")
+                    
+                    if not available_site_ids:
+                        print("✓ Tất cả site_ids đã tồn tại, bỏ qua")
+                        skipped_count += 1
+                        continue
+                    
+                    print(f"Site_ids sẽ tạo mới: {available_site_ids}")
+                    need_to_create = len(available_site_ids)
                 
                 except Exception as e:
                     print(f"✗ Lỗi khi kiểm tra dữ liệu movie {movie_id}: {e}")
@@ -373,31 +386,29 @@ def process_movies(conn, quantity, start_id=None):
                 batch_count = 0
                 
                 # Xử lý theo batch để giảm rủi ro
-                try:
-                    for j in range(need_to_create):
-                        current_site_id += 1
-                        
+                try:                    
+                    for j, target_site_id in enumerate(available_site_ids):
                         # Generate new title and description
                         if movie_titles:
                             new_title = paraphase(movie_titles)
                         else:
-                            new_title = f"Generated Title {current_site_id}"
+                            new_title = f"Generated Title {target_site_id}"
                         
                         if movie_description:
                             new_description = paraphase(movie_description)
                         else:
-                            new_description = f"Generated Description {current_site_id}"
+                            new_description = f"Generated Description {target_site_id}"
                         
                         # Tạo bản ghi mới
-                        success = create_movie_titles(conn, movie_id, current_site_id, new_title, new_description)
+                        success = create_movie_titles(conn, movie_id, target_site_id, new_title, new_description)
                         if success:
                             created_in_this_movie += 1
                             generated_count += 1
                             batch_count += 1
-                            print(f"  ✓ Tạo thành công site_id: {current_site_id}")
+                            print(f"  ✓ Tạo thành công site_id: {target_site_id}")
                             
                             # Commit sau mỗi batch_size records hoặc khi hoàn thành
-                            if batch_count >= batch_size or j == need_to_create - 1:
+                            if batch_count >= batch_size or j == len(available_site_ids) - 1:
                                 try:
                                     conn.commit()
                                     print(f"    → Đã lưu batch {batch_count} records vào DB")
@@ -407,7 +418,7 @@ def process_movies(conn, quantity, start_id=None):
                                     conn.rollback()
                                     break
                         else:
-                            print(f"  ✗ Lỗi tạo site_id: {current_site_id}")
+                            print(f"  ✗ Lỗi tạo site_id: {target_site_id}")
                             # Nếu có lỗi tạo record, vẫn tiếp tục với record tiếp theo
                             continue
                     
@@ -474,16 +485,36 @@ def main():
         except Exception as e:
             print(f"Không thể lấy phạm vi ID: {e}")
         
-        # Bước 5: Nhập số lượng cần generate
+        # Bước 5: Nhập danh sách site_id (bắt buộc)
+        site_ids = None
         while True:
+            site_ids_input = input(f"\nNhập danh sách site_id cần generate (VD: 1,2,3,4,5): ").strip()
+            if not site_ids_input:
+                print("Danh sách site_id là bắt buộc!")
+                continue
             try:
-                quantity = int(input(f"\nNhập số lượng title cần generate cho mỗi phim: "))
-                if quantity <= 0:
-                    print("Số lượng phải lớn hơn 0!")
+                # Parse danh sách site_id
+                site_ids = [int(x.strip()) for x in site_ids_input.split(',') if x.strip()]
+                if not site_ids:
+                    print("Danh sách site_id không được để trống!")
                     continue
+                
+                # Kiểm tra tất cả site_id > 0
+                if any(sid <= 0 for sid in site_ids):
+                    print("Tất cả site_id phải lớn hơn 0!")
+                    continue
+                
+                # Kiểm tra không có site_id trùng lặp
+                if len(site_ids) != len(set(site_ids)):
+                    print("Danh sách site_id không được có phần tử trùng lặp!")
+                    continue
+                
+                # Sắp xếp site_ids để xử lý theo thứ tự
+                site_ids.sort()
+                print(f"Sẽ generate {len(site_ids)} titles cho mỗi phim với site_ids: {site_ids}")
                 break
             except ValueError:
-                print("Vui lòng nhập số nguyên hợp lệ!")
+                print("Vui lòng nhập danh sách số nguyên cách nhau bởi dấu phẩy!")
         
         # Bước 6: Nhập ID movie bắt đầu (tùy chọn)
         start_id = None
@@ -509,11 +540,44 @@ def main():
             except ValueError:
                 print("Vui lòng nhập số nguyên hợp lệ!")
         
-        print(f"\n✓ Sẽ generate {quantity} titles cho mỗi phim")
+        # Bước 7: Nhập ID movie kết thúc (tùy chọn)
+        end_id = None
+        if start_id is not None:
+            while True:
+                end_input = input(f"Nhập ID movie kết thúc (Enter để xử lý đến hết): ").strip()
+                if not end_input:
+                    break
+                try:
+                    end_id = int(end_input)
+                    if end_id <= 0:
+                        print("ID movie phải lớn hơn 0!")
+                        continue
+                    if end_id < start_id:
+                        print(f"ID kết thúc phải >= ID bắt đầu ({start_id})!")
+                        continue
+                    # Kiểm tra ID có tồn tại không
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COUNT(*) FROM movie WHERE id >= %s AND id <= %s", (start_id, end_id))
+                        count = cur.fetchone()[0]
+                        if count == 0:
+                            print(f"Không tìm thấy movie nào trong khoảng {start_id} - {end_id}!")
+                            continue
+                        else:
+                            print(f"Tìm thấy {count:,} movies trong khoảng {start_id} - {end_id}")
+                    break
+                except ValueError:
+                    print("Vui lòng nhập số nguyên hợp lệ!")
+        
+
+        
+        print(f"\n✓ Sẽ generate {len(site_ids)} titles cho mỗi phim")
         if start_id:
             print(f"✓ Bắt đầu từ Movie ID: {start_id}")
         else:
             print("✓ Bắt đầu từ movie đầu tiên")
+        if end_id:
+            print(f"✓ Kết thúc tại Movie ID: {end_id}")
+        print(f"✓ Sử dụng site_ids: {site_ids}")
         
         # Xác nhận trước khi bắt đầu
         confirm = input("\nBạn có muốn tiếp tục? (y/n): ").lower().strip()
@@ -521,19 +585,22 @@ def main():
             print("Hủy bỏ thao tác.")
             return
         
-        # Bước 7: Xử lý movies
-        processed, skipped, generated = process_movies(conn, quantity, start_id)
+        # Bước 8: Xử lý movies
+        processed, skipped, generated = process_movies(conn, site_ids, start_id, end_id)
         
-        # Bước 8: Hiển thị kết quả
+        # Bước 9: Hiển thị kết quả
         print("\n" + "=" * 50)
         print("KẾT QUẢ XỬ LÝ")
         print("=" * 50)
         print(f"Tổng số movies đã xử lý: {processed:,}")
-        print(f"Số movies đã bỏ qua (đủ titles): {skipped:,}")
+        print(f"Số movies đã bỏ qua (tất cả site_ids đã tồn tại): {skipped:,}")
         print(f"Tổng số titles đã generate: {generated:,}")
         print(f"Tổng số movies trong DB: {movie_count:,}")
         if start_id:
             print(f"Bắt đầu từ Movie ID: {start_id}")
+        if end_id:
+            print(f"Kết thúc tại Movie ID: {end_id}")
+        print(f"Site_ids đã sử dụng: {site_ids}")
         print("✓ Hoàn thành!")
         
     except Exception as e:
